@@ -15,6 +15,8 @@
  *
 */
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -41,10 +43,10 @@ namespace gz
         : work(_work), callback(_cb) {}
 
       /// \brief method that does the work
-      public: std::function<void()> work = std::function<void()>();
+      public: std::function<void()> work;
 
       /// \brief callback to invoke after working
-      public: std::function<void()> callback = std::function<void()>();
+      public: std::function<void()> callback;
     };
 
     /// \brief Private implementation
@@ -62,6 +64,9 @@ namespace gz
       /// \brief used to count how many threads are actively working
       public: int activeOrders = 0;
 
+      /// @brief used to count waiting external threads
+      public: std::atomic<int> awaitingWorkDone = 0;
+
       /// \brief lock for workOrders access
       public: std::mutex queueMtx;
 
@@ -73,6 +78,26 @@ namespace gz
 
       /// \brief used to signal when the pool is being shut down
       public: bool done = false;
+    };
+
+    /// @brief Simple RAII in-out counter
+    struct ScopeCounter
+    {
+      /// @brief Constructor
+      /// @param _counter reference to atomic with curren state
+      ScopeCounter(std::atomic<int>& _counter) : counter(_counter)
+      {
+        ++(this->counter);
+      }
+
+      /// @brief Destructor which will be called on scope leave
+      ~ScopeCounter()
+      {
+        --(this->counter);
+      }
+
+      /// @brief reference(!) to atomic variable
+      private: std::atomic<int> &counter;
     };
 
 //////////////////////////////////////////////////
@@ -124,6 +149,7 @@ WorkerPool::WorkerPool(const unsigned int _minThreadCount)
   unsigned int numWorkers = std::max(std::thread::hardware_concurrency(),
       std::max(_minThreadCount, 1u));
 
+  this->dataPtr->workers.reserve(numWorkers);
   // create worker threads
   for (unsigned int w = 0; w < numWorkers; ++w)
   {
@@ -139,22 +165,41 @@ WorkerPool::~WorkerPool()
   {
     std::unique_lock<std::mutex> queueLock(this->dataPtr->queueMtx);
     this->dataPtr->done = true;
+    this->dataPtr->signalNewWork.notify_all();
   }
-  this->dataPtr->signalNewWork.notify_all();
 
   for (auto &t : this->dataPtr->workers)
   {
     t.join();
   }
 
-  // Signal in case anyone is still waiting for work to finish
-  this->dataPtr->signalWorkDone.notify_all();
+  // if someone are waiting for a signal
+  if (this->dataPtr->awaitingWorkDone != 0)
+  {
+    {
+      std::unique_lock<std::mutex> queueLock(this->dataPtr->queueMtx);
+      // Signal due to someone is still waiting for work to finish
+      this->dataPtr->signalWorkDone.notify_all();
+    }
+
+    // We should wait for everyone who waiting are leave WaitForResults
+    // function to destroy all class resourse
+
+    // TODO(anyone): Use atomic wait here from C++20, busy-wait is not
+    // the best solution but for a destructor it doesn't looks too bad
+    while (this->dataPtr->awaitingWorkDone != 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
 }
 
 //////////////////////////////////////////////////
 void WorkerPool::AddWork(std::function<void()> _work, std::function<void()> _cb)
 {
   std::unique_lock<std::mutex> queueLock(this->dataPtr->queueMtx);
+  // it may happen if working thread can include new work to their pool
+  // so we don't want to allow such operation if shutdown was requested
+  if (this->dataPtr->done)
+    return;
   this->dataPtr->workOrders.emplace(_work, _cb);
   this->dataPtr->signalNewWork.notify_one();
 }
@@ -164,10 +209,11 @@ bool WorkerPool::WaitForResults(
   const std::chrono::steady_clock::duration &_timeout)
 {
   bool signaled = true;
+  ScopeCounter counter(this->dataPtr->awaitingWorkDone);
   std::unique_lock<std::mutex> queueLock(this->dataPtr->queueMtx);
 
   // Lambda to keep logic in one place for both cases
-  std::function<bool()> haveResults = [this] () -> bool
+  auto haveResults = [this] () -> bool
     {
       return this->dataPtr->done ||
         (this->dataPtr->workOrders.empty() && !this->dataPtr->activeOrders);
@@ -178,7 +224,7 @@ bool WorkerPool::WaitForResults(
     if (std::chrono::steady_clock::duration::zero() == _timeout)
     {
       // Wait forever
-      this->dataPtr->signalWorkDone.wait(queueLock);
+      this->dataPtr->signalWorkDone.wait(queueLock, haveResults);
     }
     else
     {

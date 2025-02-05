@@ -96,27 +96,19 @@ TEST(WorkerPool, WaitWithTimeout)
   EXPECT_EQ(5, workSentinel);
 }
 
-//////////////////////////////////////////////////
-// /TODO(anyone) Deflake this test
-// ref: https://github.com/gazebosim/gz-common/issues/52
-TEST(WorkerPool,
-     GZ_UTILS_TEST_ENABLED_ONLY_ON_LINUX(WaitWithTimeoutThatTimesOut))
+TEST(WorkerPool, WaitWithTimeoutThatTimesOut)
 {
   common::WorkerPool pool;
   pool.AddWork([] ()
       {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
       });
-  EXPECT_FALSE(pool.WaitForResults(std::chrono::nanoseconds(100000)));
+  EXPECT_FALSE(pool.WaitForResults(std::chrono::milliseconds(1)));
 }
 
-//////////////////////////////////////////////////
-// /TODO(anyone) Deflake this test
-// ref: https://github.com/gazebosim/gz-common/issues/53
-TEST(WorkerPool,
-     GZ_UTILS_TEST_ENABLED_ONLY_ON_LINUX(ThingsRunInParallel))
+TEST(WorkerPool, ThingsRunInParallel)
 {
-  const unsigned int hc = std::thread::hardware_concurrency();
+  const auto hc = std::thread::hardware_concurrency();
   if (2 > hc)
   {
     gzdbg << "Skipping the ThingsRunInParallel test because hardware "
@@ -130,19 +122,68 @@ TEST(WorkerPool,
   pool.AddWork([&sentinel] ()
       {
         ++sentinel;
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
       });
   pool.AddWork([&sentinel] ()
       {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         ++sentinel;
       });
-  bool result = pool.WaitForResults(std::chrono::milliseconds(9));
-  // the timing test is flaky on windows and mac
+  bool result = pool.WaitForResults(std::chrono::milliseconds(90));
   EXPECT_TRUE(result);
   if (!result)
   {
     gzdbg << "WaitForResults failed" << std::endl;
   }
   EXPECT_EQ(2, sentinel);
+}
+
+TEST(WorkerPool, SafeDestruction)
+{
+  const auto hc = std::thread::hardware_concurrency();
+  // using atomic to access from different threads
+  std::atomic<common::WorkerPool*> poolPtr;
+  poolPtr = new common::WorkerPool(hc);
+
+  // should be enough to take all workers
+  const auto tasks = hc * 2;
+
+  std::atomic<unsigned int> sentinel{0};
+  std::atomic<int> resultsReady{0};
+
+  for (unsigned int i{}; i < tasks; ++i)
+  {
+    poolPtr.load()->AddWork([&sentinel] ()
+      {
+        // sleep long enough to create whole tasks and start destruction
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        ++sentinel;
+      });
+  }
+
+  auto t1 = std::thread([&](){
+    poolPtr.load()->WaitForResults();
+    ++resultsReady;
+  });
+  auto t2 = std::thread([&](){
+    poolPtr.load()->WaitForResults();
+    ++resultsReady;
+  });
+  auto t3 = std::thread([&](){
+    poolPtr.load()->WaitForResults();
+    ++resultsReady;
+  });
+
+  EXPECT_FALSE(resultsReady);
+  // this destructor call will be blocked until whole workers are joined
+  // and whole threads who waiting will be notified
+  delete poolPtr.load();
+  EXPECT_EQ(resultsReady, 3);
+  EXPECT_LT(sentinel, tasks);
+  // on a very slow setup, like thread sanitizer EXPECT_GE(sentinel, hc) will
+  // fail due to thread even dont start execution the task, so it's not added
+
+  t1.join();
+  t2.join();
+  t3.join();
 }
