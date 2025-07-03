@@ -102,7 +102,7 @@ namespace gz
       public: bool Valid() const;
 
       /// \brief Pointer to the profiler implementation
-      private: ProfilerImpl *impl;
+      private: std::unique_ptr<ProfilerImpl> impl;
 
       /// \brief Needed for SingletonT.
       private: friend class SingletonT<Profiler>;
